@@ -1,0 +1,181 @@
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-u root'
+        }
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Clonage du projet Python'
+                git branch: 'main',
+                    url: 'https://github.com/tom-dab/cicd-project.git'
+                
+                sh '''
+                    echo "✅ Projet cloné"
+                    ls -la
+                    echo "📁 Structure du projet:"
+                    find . -name "*.py" | head -5
+                    echo ""
+                    echo "📋 Contenu backend:"
+                    ls -la backend/
+                    echo ""
+                    echo "📋 Contenu frontend:"
+                    ls -la frontend/ || echo "Pas de dossier frontend"
+                '''
+            }
+        }
+        
+        stage('Analyze Dependencies') {
+            steps {
+                sh '''
+                    echo "🔍 Analyse des dépendances requises"
+                    
+                    # Recherche des imports dans les fichiers Python
+                    echo "📦 Imports détectés:"
+                    grep -h "^from\\|^import" backend/*.py || true
+                    grep -h "^from\\|^import" frontend/*.py 2>/dev/null || true
+                    
+                    # Vérification des fichiers de dépendances
+                    echo ""
+                    echo "📄 Fichiers de dépendances:"
+                    ls -la requirements.txt setup.py pyproject.toml 2>/dev/null || echo "Aucun fichier de dépendances trouvé"
+                    
+                    # Affichage du contenu de requirements.txt s'il existe
+                    if [ -f "requirements.txt" ]; then
+                        echo ""
+                        echo "📋 Contenu de requirements.txt:"
+                        cat requirements.txt
+                    fi
+                '''
+            }
+        }
+        
+        stage('Setup & Install Dependencies') {
+            steps {
+                sh '''
+                    echo "🔧 Installation des dépendances"
+                    python -m pip install --upgrade pip
+                    
+                    # Installation des dépendances du projet
+                    if [ -f "requirements.txt" ]; then
+                        echo "📦 Installation via requirements.txt"
+                        pip install -r requirements.txt
+                    else
+                        echo "📦 Installation manuelle des dépendances détectées"
+                        # Installation de Flask et dépendances courantes pour ce type de projet
+                        pip install flask flask-cors requests
+                    fi
+                    
+                    # Installation des outils de test
+                    pip install pytest pytest-html pytest-cov
+                    
+                    echo "✅ Dépendances installées"
+                    pip list | grep -E "(flask|pytest)"
+                '''
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    echo "🧪 Exécution des tests Python"
+                    
+                    # Configuration du PYTHONPATH pour importer les modules
+                    export PYTHONPATH="${PYTHONPATH}:${PWD}/backend"
+                    
+                    # Exécution des tests depuis le répertoire racine
+                    pytest -v \\
+                        --junitxml=results.xml \\
+                        --html=report.html \\
+                        --self-contained-html \\
+                        --cov=backend \\
+                        --cov-report=html \\
+                        --cov-report=term \\
+                        backend/ || echo "Tests terminés avec erreurs"
+                    
+                    echo "📊 Résultats générés:"
+                    ls -la *.xml *.html htmlcov/ 2>/dev/null || echo "Certains rapports manquants"
+                '''
+            }
+            
+            post {
+                always {
+                    script {
+                        try {
+                            if (fileExists('results.xml')) {
+                                junit 'results.xml'
+                            }
+                            if (fileExists('report.html')) {
+                                archiveArtifacts artifacts: 'report.html'
+                            }
+                            if (fileExists('htmlcov/index.html')) {
+                                archiveArtifacts artifacts: 'htmlcov/**/*'
+                            }
+                        } catch (Exception e) {
+                            echo "Archivage partiel: ${e.getMessage()}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Test Results Summary') {
+            steps {
+                sh '''
+                    echo "📊 Résumé des tests"
+                    echo "==================="
+                    
+                    if [ -f "results.xml" ]; then
+                        # Extraction des statistiques
+                        tests=$(grep -o 'tests="[^"]*"' results.xml | cut -d'"' -f2)
+                        failures=$(grep -o 'failures="[^"]*"' results.xml | cut -d'"' -f2)
+                        errors=$(grep -o 'errors="[^"]*"' results.xml | cut -d'"' -f2)
+                        
+                        echo "📈 Résultats:"
+                        echo "Total tests: ${tests:-0}"
+                        echo "Échecs: ${failures:-0}"
+                        echo "Erreurs: ${errors:-0}"
+                        echo "Succès: $((${tests:-0} - ${failures:-0} - ${errors:-0}))"
+                        
+                        if [ "${failures:-0}" -eq 0 ] && [ "${errors:-0}" -eq 0 ] && [ "${tests:-0}" -gt 0 ]; then
+                            echo "✅ TOUS LES TESTS SONT PASSÉS!"
+                        elif [ "${tests:-0}" -eq 0 ]; then
+                            echo "⚠️ AUCUN TEST EXÉCUTÉ"
+                        else
+                            echo "❌ IL Y A DES PROBLÈMES DANS LES TESTS"
+                        fi
+                        
+                        # Détails des tests
+                        echo ""
+                        echo "📋 Détails des tests:"
+                        grep '<testcase' results.xml | sed 's/.*name="\\([^"]*\\)".*/- \\1/' || echo "Pas de détails disponibles"
+                    else
+                        echo "❌ Aucun rapport de test trouvé"
+                    fi
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Nettoyage terminé'
+        }
+        
+        success {
+            echo '🎉 Pipeline Python réussie!'
+            echo '✅ Projet cloné, dépendances installées, tests exécutés'
+        }
+        
+        failure {
+            echo '❌ Échec de la pipeline Python'
+        }
+        
+        unstable {
+            echo '⚠️ Pipeline instable - des tests ont échoué mais la pipeline continue'
+        }
+    }
+}
