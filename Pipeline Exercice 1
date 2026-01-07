@@ -1,0 +1,78 @@
+pipeline {
+    agent {
+        docker {
+            image 'debian:13-slim'
+            args '--user root -v /tmp:/tmp'
+        }
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                sh '''
+                    echo "🔧 Installation des paquets nécessaires"
+                    apt-get update
+                    apt-get install -y procps coreutils util-linux
+                    echo "✅ Paquets installés"
+                '''
+            }
+        }
+        
+        stage('Generate File') {
+            steps {
+                sh '''
+                    echo "📝 Génération du fichier système"
+                    
+                    DATE=$(date)
+                    HOSTNAME=$(hostname)
+                    CPU_CORES=$(nproc)
+                    RAM_INFO=$(grep MemTotal /proc/meminfo | awk '{print $2 " " $3}')
+                    DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+                    
+                    echo "📊 Informations collectées:"
+                    echo "Date: $DATE"
+                    echo "Hostname: $HOSTNAME"
+                    echo "CPU: $CPU_CORES coeurs"
+                    echo "RAM: $RAM_INFO"
+                    echo "Disque: $DISK_USAGE% utilisé"
+                    
+                    cat > /tmp/exercice1.log << EOF
+-----
+Exécution de la pipeline Jenkins Exercice 1
+Début d'exécution à $DATE sur $HOSTNAME
+Cette machine dispose de $CPU_CORES coeurs de CPU, et $RAM_INFO de RAM.
+Le disque principal est utilisé à $DISK_USAGE%.
+-----
+EOF
+                    
+                    echo "✅ Fichier /tmp/exercice1.log créé!"
+                '''
+            }
+        }
+        
+        stage('Verification') {
+            steps {
+                sh '''
+                    echo "🔍 Vérification du fichier généré"
+                    ls -la /tmp/exercice1.log
+                    echo ""
+                    echo "📄 Contenu final:"
+                    cat /tmp/exercice1.log
+                '''
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '🎉 Pipeline Docker réussie!'
+            // Vérification sur l'hôte que le fichier est accessible
+            script {
+                sh 'echo "Fichier accessible sur l\'hôte:" && ls -la /tmp/exercice1.log || echo "Fichier non accessible sur l\'hôte"'
+            }
+        }
+        failure {
+            echo '❌ Échec de la pipeline Docker'
+        }
+    }
+}
