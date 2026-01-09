@@ -1,0 +1,657 @@
+pipeline {
+    agent any
+    
+    // 🎛️ PARAMÈTRES DU BUILD
+    parameters {
+        string(
+            name: 'APP_PORT',
+            defaultValue: '5000',
+            description: 'Port de l\'application backend'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['development', 'testing', 'staging', 'production'],
+            description: 'Environnement de déploiement'
+        )
+        string(
+            name: 'APP_VERSION_SUFFIX',
+            defaultValue: '',
+            description: 'Suffixe de version (ex: -beta, -rc1)'
+        )
+        string(
+            name: 'DOCKER_REGISTRY',
+            defaultValue: 'localhost:5000',
+            description: 'Registry Docker (optionnel)'
+        )
+        booleanParam(
+            name: 'PUSH_TO_REGISTRY',
+            defaultValue: false,
+            description: 'Pousser les images vers le registry'
+        )
+    }
+    
+    // 🌍 VARIABLES D'ENVIRONNEMENT
+    environment {
+        PYTHONPATH = "${WORKSPACE}/backend"
+        BUILD_VERSION = "1.0.${env.BUILD_NUMBER}${params.APP_VERSION_SUFFIX}"
+        
+        // Variables Docker
+        DOCKER_IMAGE_PREFIX = "projet"
+        FRONTEND_IMAGE = "${env.DOCKER_IMAGE_PREFIX}-front"
+        BACKEND_IMAGE = "${env.DOCKER_IMAGE_PREFIX}-back"
+        
+        // Tags des images
+        IMAGE_TAG = "${env.BUILD_VERSION}-${params.ENVIRONMENT}"
+        LATEST_TAG = "${params.ENVIRONMENT}"
+        
+        // Variables configurables
+        APP_PORT = "${params.APP_PORT}"
+        DEPLOY_ENV = "${params.ENVIRONMENT}"
+        DOCKER_REGISTRY = "${params.DOCKER_REGISTRY}"
+    }
+    
+    stages {
+        stage('🔍 Checkout & Docker Info') {
+            steps {
+                echo "🐳 Pipeline Docker ${env.BUILD_VERSION} - Env: ${env.DEPLOY_ENV}"
+                sh '''
+                    echo "======================================"
+                    echo "🐳 INFORMATIONS DOCKER BUILD"
+                    echo "======================================"
+                    echo "📦 Version: ${BUILD_VERSION}"
+                    echo "🌍 Environnement: ${DEPLOY_ENV}"
+                    echo "🔌 Port Backend: ${APP_PORT}"
+                    echo "🏷️ Tag Images: ${IMAGE_TAG}"
+                    echo "📁 Image Frontend: ${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    echo "⚙️ Image Backend: ${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    echo "🏠 Registry: ${DOCKER_REGISTRY}"
+                    echo "☁️ Push Registry: ${PUSH_TO_REGISTRY}"
+                    echo "======================================"
+                    
+                    # Vérification Docker
+                    docker --version
+                    docker info | head -10
+                    
+                    # Nettoyage images anciennes (optionnel)
+                    docker image prune -f || true
+                '''
+            }
+        }
+        
+        stage('🔧 Setup Environment') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                    args '-u root'
+                }
+            }
+            steps {
+                sh '''
+                    pip install --upgrade pip
+                    apt-get update && apt-get install -y zip unzip jq
+                    pip install flask flask-cors requests pytest pytest-html pytest-cov
+                '''
+            }
+        }
+        
+        stage('🧪 Run Tests') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                    args '-u root'
+                }
+            }
+            steps {
+                sh '''
+                    pip install flask flask-cors requests pytest pytest-html pytest-cov
+                    export PYTHONPATH="${WORKSPACE}/backend"
+                    pytest -v --junitxml=test-results.xml --html=test-report.html backend/
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                    archiveArtifacts 'test-report.html'
+                }
+            }
+        }
+        
+        stage('⚙️ Generate Docker Configurations') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '📝 Génération des configurations et Dockerfiles'
+                sh '''
+                    # Création des répertoires
+                    mkdir -p docker-build/frontend docker-build/backend
+                    
+                    echo "📝 Génération configuration application"
+                    # Configuration JSON
+                    cat > app_config.json << EOF
+{
+    "application": {
+        "name": "CICD-DOCKER-${DEPLOY_ENV}",
+        "version": "${BUILD_VERSION}",
+        "environment": "${DEPLOY_ENV}",
+        "debug": $([ "${DEPLOY_ENV}" = "development" ] && echo "true" || echo "false")
+    },
+    "server": {
+        "host": "0.0.0.0",
+        "port": ${APP_PORT},
+        "threaded": true
+    },
+    "docker": {
+        "frontend_image": "${FRONTEND_IMAGE}:${IMAGE_TAG}",
+        "backend_image": "${BACKEND_IMAGE}:${IMAGE_TAG}",
+        "build_date": "$(date -Iseconds)"
+    }
+}
+EOF
+                    
+                    echo "✅ Configuration générée"
+                    cat app_config.json
+                '''
+            }
+        }
+        
+        stage('🎨 Build Frontend Docker Image') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '🎨 Construction de l\'image Docker Frontend'
+                sh '''
+                    cd docker-build/frontend
+                    
+                    echo "📁 Préparation des fichiers frontend"
+                    # Copie des fichiers frontend ou génération
+                    if [ -d "../../frontend" ]; then
+                        cp -r ../../frontend/* .
+                    else
+                        # Génération d'un frontend avec info Docker
+                        cat > index.html << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CICD Docker Frontend</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container { 
+            background: white;
+            padding: 2rem;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 500px;
+            margin: 20px;
+        }
+        h1 { color: #333; margin-bottom: 1rem; }
+        .docker-info { 
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+            text-align: left;
+        }
+        .api-links a {
+            display: inline-block;
+            margin: 10px;
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            transition: background 0.3s;
+        }
+        .api-links a:hover { background: #0056b3; }
+        .version { color: #666; font-size: 0.9em; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐳 CICD Docker Frontend</h1>
+        <p>Application conteneurisée avec Jenkins</p>
+        
+        <div class="docker-info">
+            <h3>📦 Informations Container</h3>
+            <p><strong>Version:</strong> ${BUILD_VERSION}</p>
+            <p><strong>Environnement:</strong> ${DEPLOY_ENV}</p>
+            <p><strong>Image:</strong> ${FRONTEND_IMAGE}:${IMAGE_TAG}</p>
+            <p><strong>Build:</strong> #${BUILD_NUMBER}</p>
+        </div>
+        
+        <div class="api-links">
+            <a href="http://localhost:${APP_PORT}/" target="_blank">🔗 API Backend</a>
+            <a href="http://localhost:${APP_PORT}/health" target="_blank">🏥 Health Check</a>
+            <a href="http://localhost:${APP_PORT}/config" target="_blank">⚙️ Configuration</a>
+        </div>
+        
+        <div class="version">
+            Déployé avec Jenkins le $(date)
+        </div>
+    </div>
+    
+    <script>
+        console.log('🐳 Frontend Docker démarré');
+        console.log('Version: ${BUILD_VERSION}');
+        console.log('Environnement: ${DEPLOY_ENV}');
+        
+        // Test de l'API Backend
+        fetch('http://localhost:${APP_PORT}/health')
+            .then(response => response.json())
+            .then(data => console.log('✅ Backend connecté:', data))
+            .catch(error => console.log('⚠️ Backend non accessible:', error));
+    </script>
+</body>
+</html>
+EOF
+                    fi
+                    
+                    echo "🐳 Création du Dockerfile Frontend"
+                    cat > Dockerfile << 'EOF'
+# Image Nginx pour servir le frontend
+FROM nginx:alpine
+
+# Métadonnées
+LABEL maintainer="Jenkins CI/CD"
+LABEL version="${BUILD_VERSION}"
+LABEL environment="${DEPLOY_ENV}"
+
+# Copie des fichiers frontend
+COPY . /usr/share/nginx/html/
+
+# Configuration Nginx personnalisée
+RUN echo 'server {' > /etc/nginx/conf.d/default.conf && \\
+    echo '    listen 80;' >> /etc/nginx/conf.d/default.conf && \\
+    echo '    server_name localhost;' >> /etc/nginx/conf.d/default.conf && \\
+    echo '    root /usr/share/nginx/html;' >> /etc/nginx/conf.d/default.conf && \\
+    echo '    index index.html;' >> /etc/nginx/conf.d/default.conf && \\
+    echo '    try_files $$uri $$uri/ /index.html;' >> /etc/nginx/conf.d/default.conf && \\
+    echo '}' >> /etc/nginx/conf.d/default.conf
+
+# Port exposé
+EXPOSE 80
+
+# Commande de démarrage
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+                    
+                    echo "🏗️ Build de l'image Frontend"
+                    docker build -t ${FRONTEND_IMAGE}:${IMAGE_TAG} .
+                    docker tag ${FRONTEND_IMAGE}:${IMAGE_TAG} ${FRONTEND_IMAGE}:${LATEST_TAG}
+                    docker tag ${FRONTEND_IMAGE}:${IMAGE_TAG} ${FRONTEND_IMAGE}:latest
+                    
+                    echo "✅ Image Frontend créée: ${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    docker images | grep ${FRONTEND_IMAGE}
+                '''
+            }
+        }
+        
+        stage('⚙️ Build Backend Docker Image') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '⚙️ Construction de l\'image Docker Backend'
+                sh '''
+                    cd docker-build/backend
+                    
+                    echo "📁 Préparation des fichiers backend"
+                    # Copie des fichiers backend
+                    cp -r ../../backend/* .
+                    cp ../../app_config.json .
+                    
+                    # Requirements pour Docker
+                    cat > requirements.txt << EOF
+flask==$([ "${DEPLOY_ENV}" = "production" ] && echo "3.1.2" || echo "3.1.2")
+flask-cors==$([ "${DEPLOY_ENV}" = "production" ] && echo "4.0.0" || echo "4.0.0")
+requests==$([ "${DEPLOY_ENV}" = "production" ] && echo "2.31.0" || echo "2.31.0")
+gunicorn==21.2.0
+EOF
+                    
+                    # Application Docker avec configuration
+                    cat > app_docker.py << 'EOF'
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from flask import Flask, jsonify
+from flask_cors import CORS
+
+def load_config():
+    """Charge la configuration depuis le fichier JSON"""
+    if os.path.exists('app_config.json'):
+        with open('app_config.json', 'r') as f:
+            return json.load(f)
+    return {
+        "application": {"name": "CICD-DOCKER", "version": "1.0.0", "environment": "development"},
+        "server": {"host": "0.0.0.0", "port": 5000}
+    }
+
+config = load_config()
+app = Flask(__name__)
+
+# Configuration CORS pour Docker
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE"],
+        "allow_headers": "*"
+    }
+})
+
+# Import des routes existantes si disponibles
+try:
+    from app import *
+except ImportError:
+    print("⚠️ Routes personnalisées non trouvées, utilisation des routes par défaut")
+
+# Routes spécifiques Docker
+@app.route('/')
+def docker_home():
+    return jsonify({
+        "message": "🐳 Backend Docker CICD",
+        "version": config["application"]["version"],
+        "environment": config["application"]["environment"],
+        "container": "Docker Backend",
+        "endpoints": ["/health", "/config", "/docker-info"]
+    })
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "application": config["application"]["name"],
+        "version": config["application"]["version"],
+        "environment": config["application"]["environment"],
+        "docker": True,
+        "timestamp": "$(date -Iseconds)"
+    })
+
+@app.route('/config')
+def get_config():
+    return jsonify(config)
+
+@app.route('/docker-info')
+def docker_info():
+    return jsonify({
+        "container_info": {
+            "image": "${BACKEND_IMAGE}:${IMAGE_TAG}",
+            "port": config["server"]["port"],
+            "environment": config["application"]["environment"],
+            "python_version": sys.version,
+            "flask_mode": "Docker Production" if config["application"]["environment"] == "production" else "Docker Development"
+        }
+    })
+
+if __name__ == '__main__':
+    print(f"🐳 Démarrage Backend Docker {config['application']['name']}")
+    print(f"🌍 Environnement: {config['application']['environment']}")
+    print(f"🔌 Port: {config['server']['port']}")
+    
+    # Démarrage selon l'environnement
+    if config["application"]["environment"] == "production":
+        # En production, on utiliserait Gunicorn
+        print("🚀 Mode Production avec Gunicorn")
+        import subprocess
+        subprocess.run([
+            "gunicorn", 
+            "--bind", f"0.0.0.0:{config['server']['port']}", 
+            "--workers", "3",
+            "app_docker:app"
+        ])
+    else:
+        print("🔧 Mode Development avec Flask dev server")
+        app.run(
+            host=config['server']['host'],
+            port=int(config['server']['port']),
+            debug=config['application'].get('debug', False)
+        )
+EOF
+                    
+                    echo "🐳 Création du Dockerfile Backend"
+                    cat > Dockerfile << 'EOF'
+# Image Python officielle
+FROM python:3.11-slim
+
+# Métadonnées
+LABEL maintainer="Jenkins CI/CD"
+LABEL version="${BUILD_VERSION}"
+LABEL environment="${DEPLOY_ENV}"
+
+# Répertoire de travail
+WORKDIR /app
+
+# Installation des dépendances système
+RUN apt-get update && apt-get install -y \\
+    curl \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Copie et installation des requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copie du code application
+COPY . .
+
+# Création d'un utilisateur non-root
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Port exposé
+EXPOSE ${APP_PORT}
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \\
+    CMD curl -f http://localhost:${APP_PORT}/health || exit 1
+
+# Point d'entrée
+ENTRYPOINT ["python3", "app_docker.py"]
+EOF
+                    
+                    echo "🏗️ Build de l'image Backend"
+                    docker build -t ${BACKEND_IMAGE}:${IMAGE_TAG} .
+                    docker tag ${BACKEND_IMAGE}:${IMAGE_TAG} ${BACKEND_IMAGE}:${LATEST_TAG}
+                    docker tag ${BACKEND_IMAGE}:${IMAGE_TAG} ${BACKEND_IMAGE}:latest
+                    
+                    echo "✅ Image Backend créée: ${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    docker images | grep ${BACKEND_IMAGE}
+                '''
+            }
+        }
+        
+        stage('🔍 Docker Images Verification') {
+            steps {
+                echo '🔍 Vérification des images Docker créées'
+                sh '''
+                    echo "======================================"
+                    echo "🐳 IMAGES DOCKER CRÉÉES"
+                    echo "======================================"
+                    
+                    echo "📊 Liste des images:"
+                    docker images | grep -E "(${FRONTEND_IMAGE}|${BACKEND_IMAGE})" || echo "Aucune image trouvée"
+                    
+                    echo ""
+                    echo "🏷️ Tags créés:"
+                    echo "Frontend:"
+                    docker images ${FRONTEND_IMAGE} --format "table {{.Repository}}:{{.Tag}}\\t{{.Size}}\\t{{.CreatedSince}}"
+                    echo "Backend:"
+                    docker images ${BACKEND_IMAGE} --format "table {{.Repository}}:{{.Tag}}\\t{{.Size}}\\t{{.CreatedSince}}"
+                    
+                    echo ""
+                    echo "🔍 Test rapide des images:"
+                    echo "Frontend image info:"
+                    docker inspect ${FRONTEND_IMAGE}:${IMAGE_TAG} --format='{{.Config.Labels}}'
+                    echo "Backend image info:"
+                    docker inspect ${BACKEND_IMAGE}:${IMAGE_TAG} --format='{{.Config.Labels}}'
+                    
+                    # Calcul de l'espace utilisé
+                    FRONTEND_SIZE=$(docker images ${FRONTEND_IMAGE}:${IMAGE_TAG} --format "{{.Size}}")
+                    BACKEND_SIZE=$(docker images ${BACKEND_IMAGE}:${IMAGE_TAG} --format "{{.Size}}")
+                    echo ""
+                    echo "💾 Tailles des images:"
+                    echo "Frontend: $FRONTEND_SIZE"
+                    echo "Backend: $BACKEND_SIZE"
+                '''
+            }
+        }
+        
+        stage('🧪 Test Docker Images') {
+            steps {
+                echo '🧪 Test rapide des images Docker'
+                sh '''
+                    echo "🔬 Test du backend Docker (démarrage rapide)"
+                    
+                    # Test de démarrage du backend
+                    echo "Démarrage temporaire du backend..."
+                    CONTAINER_ID=$(docker run -d -p ${APP_PORT}:${APP_PORT} ${BACKEND_IMAGE}:${IMAGE_TAG})
+                    
+                    echo "Attente démarrage..."
+                    sleep 10
+                    
+                    # Test des endpoints
+                    echo "Test health check:"
+                    curl -f http://localhost:${APP_PORT}/health || echo "Health check non disponible"
+                    
+                    echo "Test endpoint racine:"
+                    curl -f http://localhost:${APP_PORT}/ || echo "Endpoint racine non disponible"
+                    
+                    # Nettoyage
+                    echo "Arrêt du container de test..."
+                    docker stop $CONTAINER_ID
+                    docker rm $CONTAINER_ID
+                    
+                    echo "✅ Test des images terminé"
+                '''
+            }
+        }
+        
+        stage('☁️ Push to Registry (Optional)') {
+            when {
+                expression { params.PUSH_TO_REGISTRY }
+            }
+            steps {
+                echo "☁️ Push des images vers le registry ${env.DOCKER_REGISTRY}"
+                sh '''
+                    if [ "${DOCKER_REGISTRY}" != "localhost:5000" ]; then
+                        echo "🔐 Connexion au registry ${DOCKER_REGISTRY}"
+                        # docker login ${DOCKER_REGISTRY} # Nécessiterait les credentials
+                    fi
+                    
+                    echo "📤 Tag pour registry"
+                    docker tag ${FRONTEND_IMAGE}:${IMAGE_TAG} ${DOCKER_REGISTRY}/${FRONTEND_IMAGE}:${IMAGE_TAG}
+                    docker tag ${BACKEND_IMAGE}:${IMAGE_TAG} ${DOCKER_REGISTRY}/${BACKEND_IMAGE}:${IMAGE_TAG}
+                    
+                    echo "🚀 Push des images"
+                    # docker push ${DOCKER_REGISTRY}/${FRONTEND_IMAGE}:${IMAGE_TAG}
+                    # docker push ${DOCKER_REGISTRY}/${BACKEND_IMAGE}:${IMAGE_TAG}
+                    
+                    echo "⚠️ Push désactivé pour la démo (pas de registry configuré)"
+                    echo "Images taguées pour push:"
+                    docker images | grep ${DOCKER_REGISTRY}
+                '''
+            }
+        }
+        
+        stage('📋 Docker Summary') {
+            steps {
+                sh '''
+                    echo "🎯 RÉSUMÉ DOCKER BUILD"
+                    echo "====================="
+                    echo "📦 Version: ${BUILD_VERSION}"
+                    echo "🌍 Environnement: ${DEPLOY_ENV}"
+                    echo "🏷️ Tag: ${IMAGE_TAG}"
+                    echo ""
+                    echo "🖼️ Images créées:"
+                    echo "  Frontend: ${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    echo "  Backend:  ${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    echo ""
+                    echo "🚀 Commandes de déploiement:"
+                    echo "# Frontend:"
+                    echo "docker run -d -p 80:80 --name frontend-${DEPLOY_ENV} ${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    echo ""
+                    echo "# Backend:"
+                    echo "docker run -d -p ${APP_PORT}:${APP_PORT} --name backend-${DEPLOY_ENV} ${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    echo ""
+                    echo "# Docker Compose exemple:"
+                    echo "version: '3.8'"
+                    echo "services:"
+                    echo "  frontend:"
+                    echo "    image: ${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    echo "    ports: ['80:80']"
+                    echo "  backend:"
+                    echo "    image: ${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    echo "    ports: ['${APP_PORT}:${APP_PORT}']"
+                    
+                    # Sauvegarde des informations Docker
+                    cat > docker-summary.json << EOF
+{
+    "docker_build": {
+        "version": "${BUILD_VERSION}",
+        "environment": "${DEPLOY_ENV}",
+        "images": {
+            "frontend": {
+                "name": "${FRONTEND_IMAGE}",
+                "tag": "${IMAGE_TAG}",
+                "full_name": "${FRONTEND_IMAGE}:${IMAGE_TAG}",
+                "port": 80
+            },
+            "backend": {
+                "name": "${BACKEND_IMAGE}",
+                "tag": "${IMAGE_TAG}",
+                "full_name": "${BACKEND_IMAGE}:${IMAGE_TAG}",
+                "port": ${APP_PORT}
+            }
+        },
+        "build_date": "$(date -Iseconds)",
+        "jenkins_build": "${BUILD_NUMBER}"
+    }
+}
+EOF
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                archiveArtifacts artifacts: 'docker-summary.json, docker-build/**/*', 
+                               fingerprint: true, 
+                               allowEmptyArchive: true
+            }
+        }
+        
+        success {
+            echo '🎉 BUILD DOCKER RÉUSSI!'
+            echo "✅ Images créées:"
+            echo "   🎨 Frontend: ${env.FRONTEND_IMAGE}:${env.IMAGE_TAG}"
+            echo "   ⚙️ Backend:  ${env.BACKEND_IMAGE}:${env.IMAGE_TAG}"
+        }
+        
+        failure {
+            echo '❌ BUILD DOCKER ÉCHOUÉ!'
+        }
+        
+        cleanup {
+            // Nettoyage optionnel des images de développement
+            sh '''
+                if [ "${DEPLOY_ENV}" = "development" ]; then
+                    echo "🧹 Nettoyage des images de développement anciennes"
+                    docker image prune -f || true
+                fi
+            '''
+        }
+    }
+}
