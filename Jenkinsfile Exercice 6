@@ -1,0 +1,515 @@
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-u root'
+        }
+    }
+    
+    // 🎛️ PARAMÈTRES DU BUILD
+    parameters {
+        string(
+            name: 'APP_PORT',
+            defaultValue: '5000',
+            description: 'Port de l\'application backend'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['development', 'testing', 'staging', 'production'],
+            description: 'Environnement de déploiement'
+        )
+        string(
+            name: 'APP_VERSION_SUFFIX',
+            defaultValue: '',
+            description: 'Suffixe de version (ex: -beta, -rc1)'
+        )
+        booleanParam(
+            name: 'ENABLE_DEBUG',
+            defaultValue: false,
+            description: 'Activer le mode debug Flask'
+        )
+        string(
+            name: 'DEPLOY_TARGET',
+            defaultValue: '192.168.238.130',
+            description: 'IP du serveur de déploiement'
+        )
+    }
+    
+    // 🌍 VARIABLES D'ENVIRONNEMENT
+    environment {
+        PYTHONPATH = "${WORKSPACE}/backend"
+        BUILD_VERSION = "1.0.${env.BUILD_NUMBER}${params.APP_VERSION_SUFFIX}"
+        ARTIFACT_PREFIX = "cicd-project-${env.BUILD_VERSION}"
+        
+        // Variables configurables depuis les paramètres
+        APP_PORT = "${params.APP_PORT}"
+        DEPLOY_ENV = "${params.ENVIRONMENT}"
+        DEBUG_MODE = "${params.ENABLE_DEBUG}"
+        DEPLOY_SERVER = "${params.DEPLOY_TARGET}"
+        DEPLOY_USER = 'deploy'
+        
+        // Variables dérivées
+        APP_NAME = "CICD-${env.DEPLOY_ENV.toUpperCase()}"
+        CONFIG_FILE = "app_config_${env.DEPLOY_ENV}.json"
+    }
+    
+    stages {
+        stage('🔍 Checkout & Parameters Info') {
+            steps {
+                echo "🚀 Pipeline ${env.BUILD_VERSION} - Environnement: ${env.DEPLOY_ENV}"
+                sh '''
+                    echo "======================================"
+                    echo "📋 PARAMÈTRES DE BUILD"
+                    echo "======================================"
+                    echo "🎯 Environment: ${DEPLOY_ENV}"
+                    echo "🔌 Port Application: ${APP_PORT}"
+                    echo "🐛 Mode Debug: ${DEBUG_MODE}"
+                    echo "📦 Version: ${BUILD_VERSION}"
+                    echo "🌐 Serveur Deploy: ${DEPLOY_SERVER}"
+                    echo "📱 Nom Application: ${APP_NAME}"
+                    echo "⚙️ Fichier Config: ${CONFIG_FILE}"
+                    echo "======================================"
+                    
+                    echo "📁 Structure du projet:"
+                    ls -la
+                    find . -name "*.py" -type f
+                '''
+            }
+        }
+        
+        stage('🔧 Setup Environment') {
+            steps {
+                sh '''
+                    pip install --upgrade pip
+                    apt-get update && apt-get install -y zip unzip openssh-client jq
+                    
+                    # Dépendances Python avec versions selon l'environnement
+                    if [ "${DEPLOY_ENV}" = "production" ]; then
+                        echo "📦 Installation versions production (figées)"
+                        pip install flask==3.1.2 flask-cors==4.0.0 requests==2.31.0
+                    else
+                        echo "📦 Installation versions développement (flexibles)"
+                        pip install flask flask-cors requests
+                    fi
+                    
+                    pip install pytest pytest-html pytest-cov
+                    
+                    echo "✅ Setup terminé pour environnement: ${DEPLOY_ENV}"
+                '''
+            }
+        }
+        
+        stage('🧪 Run Tests') {
+            steps {
+                sh '''
+                    export PYTHONPATH="${WORKSPACE}/backend"
+                    
+                    # Tests avec configuration selon l'environnement
+                    if [ "${DEPLOY_ENV}" = "production" ]; then
+                        echo "🔬 Tests complets pour production"
+                        pytest -v --junitxml=test-results.xml --html=test-report.html --cov=backend backend/
+                    else
+                        echo "🔬 Tests rapides pour ${DEPLOY_ENV}"
+                        pytest -v --junitxml=test-results.xml --html=test-report.html backend/
+                    fi
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                    archiveArtifacts 'test-report.html'
+                }
+            }
+        }
+        
+        stage('⚙️ Generate Configuration') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '⚙️ Génération de la configuration applicative'
+                sh '''
+                    echo "📝 Création du fichier de configuration: ${CONFIG_FILE}"
+                    
+                    # Génération de la configuration JSON
+                    cat > ${CONFIG_FILE} << EOF
+{
+    "application": {
+        "name": "${APP_NAME}",
+        "version": "${BUILD_VERSION}",
+        "environment": "${DEPLOY_ENV}",
+        "debug": ${DEBUG_MODE}
+    },
+    "server": {
+        "host": "0.0.0.0",
+        "port": ${APP_PORT},
+        "threaded": true
+    },
+    "database": {
+        "enabled": $([ "${DEPLOY_ENV}" = "development" ] && echo "false" || echo "true"),
+        "connection_pool": $([ "${DEPLOY_ENV}" = "production" ] && echo "20" || echo "5")
+    },
+    "logging": {
+        "level": "$([ "${DEPLOY_ENV}" = "production" ] && echo "WARNING" || echo "DEBUG")",
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    },
+    "security": {
+        "cors_enabled": $([ "${DEPLOY_ENV}" = "development" ] && echo "true" || echo "false"),
+        "csrf_protection": $([ "${DEPLOY_ENV}" = "production" ] && echo "true" || echo "false")
+    },
+    "build_info": {
+        "build_number": "${BUILD_NUMBER}",
+        "build_date": "$(date -Iseconds)",
+        "git_commit": "${GIT_COMMIT:-unknown}",
+        "jenkins_url": "${BUILD_URL:-unknown}"
+    }
+}
+EOF
+                    
+                    echo "✅ Configuration générée:"
+                    cat ${CONFIG_FILE}
+                    
+                    # Validation JSON
+                    if command -v jq >/dev/null 2>&1; then
+                        echo "🔍 Validation JSON..."
+                        jq . ${CONFIG_FILE} && echo "✅ JSON valide" || echo "❌ JSON invalide"
+                    fi
+                '''
+            }
+        }
+        
+        stage('📦 Build Packages') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                sh '''
+                    mkdir -p dist/frontend dist/backend
+                    
+                    echo "🎨 Build Frontend avec configuration"
+                    cat > dist/frontend/index.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${APP_NAME} - v${BUILD_VERSION}</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: $([ "${DEPLOY_ENV}" = "production" ] && echo "#f8f9fa" || echo "#e3f2fd"); }
+        .header { text-align: center; margin-bottom: 30px; }
+        .config { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .env-$(echo ${DEPLOY_ENV}) { border-left: 4px solid $([ "${DEPLOY_ENV}" = "production" ] && echo "#28a745" || [ "${DEPLOY_ENV}" = "staging" ] && echo "#ffc107" || echo "#007bff"); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 ${APP_NAME}</h1>
+        <p>Version ${BUILD_VERSION} - Environnement: ${DEPLOY_ENV}</p>
+    </div>
+    
+    <div class="config env-${DEPLOY_ENV}">
+        <h2>📊 Configuration</h2>
+        <ul>
+            <li><strong>Port Backend:</strong> ${APP_PORT}</li>
+            <li><strong>Mode Debug:</strong> ${DEBUG_MODE}</li>
+            <li><strong>Build:</strong> #${BUILD_NUMBER}</li>
+            <li><strong>Date:</strong> $(date)</li>
+        </ul>
+        
+        <p><a href="http://${DEPLOY_SERVER}:${APP_PORT}/" target="_blank">🔗 Accéder à l'API Backend</a></p>
+        <p><a href="http://${DEPLOY_SERVER}:${APP_PORT}/config" target="_blank">⚙️ Voir la configuration API</a></p>
+    </div>
+</body>
+</html>
+EOF
+                    
+                    echo "⚙️ Build Backend avec configuration dynamique"
+                    # Copie de l'application originale
+                    cp backend/app.py dist/backend/
+                    
+                    # Copie de la configuration générée
+                    cp ${CONFIG_FILE} dist/backend/
+                    
+                    # Génération des requirements selon l'environnement
+                    cat > dist/backend/requirements.txt << EOF
+$([ "${DEPLOY_ENV}" = "production" ] && echo "flask==3.1.2" || echo "flask>=3.1.0")
+$([ "${DEPLOY_ENV}" = "production" ] && echo "flask-cors==4.0.0" || echo "flask-cors>=4.0.0")
+$([ "${DEPLOY_ENV}" = "production" ] && echo "requests==2.31.0" || echo "requests>=2.31.0")
+EOF
+                    
+                    # Application configurée dynamiquement
+                    cat > dist/backend/app_configured.py << 'EOF'
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from flask import Flask, jsonify
+
+# Chargement de la configuration
+def load_config():
+    config_files = [
+        'app_config_production.json',
+        'app_config_staging.json', 
+        'app_config_testing.json',
+        'app_config_development.json'
+    ]
+    
+    for config_file in config_files:
+        if os.path.exists(config_file):
+            print(f"📖 Chargement configuration: {config_file}")
+            with open(config_file, 'r') as f:
+                return json.load(f)
+    
+    print("⚠️ Aucun fichier de configuration trouvé, utilisation des valeurs par défaut")
+    return {
+        "application": {"name": "CICD-DEFAULT", "version": "1.0.0", "environment": "development", "debug": True},
+        "server": {"host": "0.0.0.0", "port": 5000, "threaded": True}
+    }
+
+config = load_config()
+app = Flask(__name__)
+
+# Configuration Flask depuis le fichier JSON
+app.config['DEBUG'] = config['application']['debug']
+app.config['TESTING'] = config['application']['environment'] == 'testing'
+
+# Import de l'application originale
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from app import *  # Import des routes existantes
+except ImportError as e:
+    print(f"⚠️ Impossible d'importer l'app originale: {e}")
+
+# Route de configuration
+@app.route('/config')
+def get_config():
+    return jsonify(config)
+
+# Route de santé
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "application": config['application']['name'],
+        "version": config['application']['version'],
+        "environment": config['application']['environment'],
+        "port": config['server']['port']
+    })
+
+if __name__ == '__main__':
+    print(f"🚀 Démarrage {config['application']['name']} v{config['application']['version']}")
+    print(f"🌍 Environnement: {config['application']['environment']}")
+    print(f"🔌 Port: {config['server']['port']}")
+    print(f"🐛 Debug: {config['application']['debug']}")
+    
+    app.run(
+        host=config['server']['host'],
+        port=int(config['server']['port']),
+        debug=config['application']['debug'],
+        threaded=config['server']['threaded']
+    )
+EOF
+                    
+                    # Service systemd avec port dynamique
+                    cat > dist/backend/backend-app.service << EOF
+[Unit]
+Description=${APP_NAME} Backend
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/opt/backend-app
+ExecStart=/usr/bin/python3 app_configured.py
+Restart=always
+RestartSec=5
+Environment=FLASK_ENV=${DEPLOY_ENV}
+Environment=APP_PORT=${APP_PORT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                    
+                    # Archives avec versioning
+                    cd dist
+                    zip -r "${ARTIFACT_PREFIX}-frontend-${DEPLOY_ENV}.zip" frontend/
+                    zip -r "${ARTIFACT_PREFIX}-backend-${DEPLOY_ENV}.zip" backend/
+                    cd ..
+                    
+                    echo "✅ Packages créés pour environnement ${DEPLOY_ENV}:"
+                    ls -la dist/
+                    
+                    echo "📋 Contenu backend généré:"
+                    ls -la dist/backend/
+                '''
+            }
+        }
+        
+        stage('🚀 Deploy with Environment Config') {
+            when {
+                allOf {
+                    expression { currentBuild.result != 'FAILURE' }
+                    not { equals expected: 'development', actual: params.ENVIRONMENT }
+                }
+            }
+            steps {
+                echo "🌐 Déploiement sur ${env.DEPLOY_ENV} - Port: ${env.APP_PORT}"
+                sshagent(['deploy-ssh-key']) {
+                    sh '''
+                        echo "📤 Déploiement avec configuration ${DEPLOY_ENV}"
+                        
+                        # Copie des archives
+                        scp -o StrictHostKeyChecking=no \\
+                            "dist/${ARTIFACT_PREFIX}-frontend-${DEPLOY_ENV}.zip" \\
+                            "dist/${ARTIFACT_PREFIX}-backend-${DEPLOY_ENV}.zip" \\
+                            ${DEPLOY_USER}@${DEPLOY_SERVER}:/tmp/
+                        
+                        # Déploiement configuré
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} << 'DEPLOY_EOF'
+echo "🛑 Arrêt services existants"
+sudo systemctl stop backend-app 2>/dev/null || true
+
+echo "🧹 Nettoyage"
+sudo rm -rf /var/www/html/* /opt/backend-app/*
+
+echo "🎨 Déploiement Frontend ${DEPLOY_ENV}"
+cd /tmp
+unzip -o ${ARTIFACT_PREFIX}-frontend-${DEPLOY_ENV}.zip
+sudo cp -r frontend/* /var/www/html/
+sudo chown -R www-data:www-data /var/www/html
+
+echo "⚙️ Déploiement Backend avec port ${APP_PORT}"
+unzip -o ${ARTIFACT_PREFIX}-backend-${DEPLOY_ENV}.zip
+sudo cp -r backend/* /opt/backend-app/
+sudo chown -R deploy:deploy /opt/backend-app
+sudo chmod +x /opt/backend-app/app_configured.py
+
+echo "📦 Installation dépendances selon environnement"
+cd /opt/backend-app
+pip3 install --user -r requirements.txt
+
+echo "⚙️ Configuration service systemd"
+sudo cp backend-app.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable backend-app
+
+echo "🚀 Démarrage avec configuration ${DEPLOY_ENV}"
+sudo systemctl start backend-app
+sleep 8
+
+echo "✅ Vérification déploiement"
+curl -s http://localhost:${APP_PORT}/health || echo "Backend encore en démarrage..."
+sudo systemctl status backend-app --no-pager -l
+
+echo "🎉 Déploiement ${DEPLOY_ENV} terminé sur port ${APP_PORT}"
+DEPLOY_EOF
+                    '''
+                }
+            }
+        }
+        
+        stage('🧪 Environment Verification') {
+            when {
+                not { equals expected: 'development', actual: params.ENVIRONMENT }
+            }
+            steps {
+                echo '🔍 Tests de vérification environnement'
+                sshagent(['deploy-ssh-key']) {
+                    sh '''
+                        sleep 10
+                        
+                        echo "🌐 Test Frontend"
+                        FRONTEND_STATUS=$(ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} \\
+                            "curl -s -o /dev/null -w '%{http_code}' http://localhost/")
+                        
+                        echo "🐍 Test Backend sur port ${APP_PORT}"
+                        BACKEND_STATUS=$(ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} \\
+                            "curl -s -o /dev/null -w '%{http_code}' http://localhost:${APP_PORT}/" || echo "000")
+                        
+                        echo "⚙️ Test configuration API"
+                        CONFIG_RESPONSE=$(ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} \\
+                            "curl -s http://localhost:${APP_PORT}/config" || echo "{}")
+                        
+                        echo "🏥 Test health check"
+                        HEALTH_RESPONSE=$(ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_SERVER} \\
+                            "curl -s http://localhost:${APP_PORT}/health" || echo "{}")
+                        
+                        echo "======================================"
+                        echo "📊 RÉSULTATS VÉRIFICATION"
+                        echo "======================================"
+                        echo "Frontend Status: $FRONTEND_STATUS"
+                        echo "Backend Status: $BACKEND_STATUS"
+                        echo "Config API: $CONFIG_RESPONSE"
+                        echo "Health Check: $HEALTH_RESPONSE"
+                        echo "======================================"
+                        
+                        # Validation des résultats
+                        if [ "$FRONTEND_STATUS" = "200" ] && [ "$BACKEND_STATUS" = "200" ]; then
+                            echo "✅ Déploiement ${DEPLOY_ENV} validé sur port ${APP_PORT}"
+                        else
+                            echo "⚠️ Problème de déploiement détecté"
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('📊 Summary') {
+            steps {
+                sh '''
+                    echo "🎯 RÉSUMÉ FINAL"
+                    echo "=============="
+                    echo "📦 Version: ${BUILD_VERSION}"
+                    echo "🌍 Environnement: ${DEPLOY_ENV}"
+                    echo "🔌 Port: ${APP_PORT}"
+                    echo "🐛 Debug: ${DEBUG_MODE}"
+                    echo "🌐 URLs:"
+                    echo "  Frontend: http://${DEPLOY_SERVER}/"
+                    echo "  Backend: http://${DEPLOY_SERVER}:${APP_PORT}/"
+                    echo "  Config API: http://${DEPLOY_SERVER}:${APP_PORT}/config"
+                    echo "  Health: http://${DEPLOY_SERVER}:${APP_PORT}/health"
+                    
+                    # Sauvegarde info déploiement
+                    cat > deployment-summary.json << EOF
+{
+    "deployment": {
+        "version": "${BUILD_VERSION}",
+        "environment": "${DEPLOY_ENV}",
+        "port": ${APP_PORT},
+        "debug": ${DEBUG_MODE},
+        "server": "${DEPLOY_SERVER}",
+        "date": "$(date -Iseconds)",
+        "urls": {
+            "frontend": "http://${DEPLOY_SERVER}/",
+            "backend": "http://${DEPLOY_SERVER}:${APP_PORT}/",
+            "config": "http://${DEPLOY_SERVER}:${APP_PORT}/config",
+            "health": "http://${DEPLOY_SERVER}:${APP_PORT}/health"
+        }
+    }
+}
+EOF
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                archiveArtifacts artifacts: 'dist/*.zip, deployment-summary.json, app_config_*.json', 
+                               fingerprint: true, 
+                               allowEmptyArchive: true
+            }
+        }
+        
+        success {
+            echo "🎉 DÉPLOIEMENT PARAMÉTRÉ RÉUSSI!"
+            echo "✅ ${env.APP_NAME} v${env.BUILD_VERSION}"
+            echo "🌍 Environnement: ${env.DEPLOY_ENV}"
+            echo "🔌 Port configuré: ${env.APP_PORT}"
+        }
+        
+        failure {
+            echo '❌ DÉPLOIEMENT PARAMÉTRÉ ÉCHOUÉ!'
+        }
+    }
+}
