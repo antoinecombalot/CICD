@@ -1,0 +1,243 @@
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-u root'
+        }
+    }
+    
+    environment {
+        PYTHONPATH = "${WORKSPACE}/backend"
+        BUILD_VERSION = "1.0.${env.BUILD_NUMBER}"
+        ARTIFACT_PREFIX = "cicd-project-${env.BUILD_VERSION}"
+    }
+    
+    stages {
+        stage('🔍 Checkout & Info') {
+            steps {
+                echo "🚀 Démarrage pipeline ${env.BUILD_VERSION}"
+                sh '''
+                    echo "✅ Code source récupéré"
+                    ls -la
+                    echo "🐍 Fichiers Python:"
+                    find . -name "*.py" -type f
+                '''
+            }
+        }
+        
+        stage('🔧 Setup Environment') {
+            steps {
+                echo '🔧 Configuration environnement'
+                sh '''
+                    pip install --upgrade pip
+                    apt-get update && apt-get install -y zip unzip
+                    
+                    if [ -f "requirements.txt" ]; then
+                        pip install -r requirements.txt
+                    else
+                        pip install flask flask-cors requests
+                    fi
+                    
+                    pip install pytest pytest-html pytest-cov
+                    echo "✅ Environnement prêt"
+                '''
+            }
+        }
+        
+        stage('🧪 Run Tests') {
+            steps {
+                echo '🧪 Exécution des tests'
+                sh '''
+                    export PYTHONPATH="${WORKSPACE}/backend"
+                    
+                    pytest -v \\
+                        --junitxml=test-results.xml \\
+                        --html=test-report.html \\
+                        --self-contained-html \\
+                        backend/ || TEST_EXIT_CODE=$?
+                    
+                    if [ "${TEST_EXIT_CODE:-0}" -ne 0 ]; then
+                        echo "❌ Tests échoués - arrêt du build"
+                        exit ${TEST_EXIT_CODE}
+                    else
+                        echo "✅ Tests réussis"
+                    fi
+                '''
+            }
+            
+            post {
+                always {
+                    junit 'test-results.xml'
+                    archiveArtifacts artifacts: 'test-report.html', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('📦 Build Frontend') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '🎨 Build Frontend'
+                sh '''
+                    mkdir -p dist/frontend
+                    
+                    if [ -d "frontend" ]; then
+                        cp -r frontend/* dist/frontend/
+                        echo "✅ Frontend copié"
+                    else
+                        echo "<h1>Demo Frontend v${BUILD_VERSION}</h1>" > dist/frontend/index.html
+                        echo "✅ Frontend demo créé"
+                    fi
+                    
+                    echo "Build: ${BUILD_VERSION}" > dist/frontend/version.txt
+                    echo "Date: $(date)" >> dist/frontend/version.txt
+                    
+                    cd dist
+                    zip -r "${ARTIFACT_PREFIX}-frontend.zip" frontend/
+                    cd ..
+                    
+                    echo "✅ Frontend packagé"
+                '''
+            }
+        }
+        
+        stage('🐍 Build Backend') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                echo '⚙️ Build Backend'
+                sh '''
+                    mkdir -p dist/backend
+                    
+                    if [ -d "backend" ]; then
+                        echo "📂 Copie des fichiers backend"
+                        for file in backend/*.py; do
+                            if [[ "$file" != *test* ]]; then
+                                cp "$file" dist/backend/
+                                echo "Copié: $(basename "$file")"
+                            fi
+                        done
+                        
+                        [ -f "requirements.txt" ] && cp requirements.txt dist/backend/
+                        
+                        echo "📝 Création version.py"
+                        cat > dist/backend/version.py << VEOF
+BUILD_VERSION = "${BUILD_VERSION}"
+BUILD_DATE = "$(date)"
+BUILD_NUMBER = "${BUILD_NUMBER}"
+
+def get_version_info():
+    return {
+        "version": BUILD_VERSION,
+        "build_date": BUILD_DATE,
+        "build_number": BUILD_NUMBER
+    }
+VEOF
+                        
+                        echo "📝 Création start.py"
+                        cat > dist/backend/start.py << SEOF
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from app import app
+    from version import get_version_info
+    
+    print("🚀 Démarrage backend")
+    print(f"📦 Version: {get_version_info()}")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)
+    
+except ImportError as e:
+    print(f"❌ Erreur import: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"❌ Erreur: {e}")
+    sys.exit(1)
+SEOF
+                        
+                        cd dist
+                        zip -r "${ARTIFACT_PREFIX}-backend.zip" backend/
+                        cd ..
+                        
+                        echo "✅ Backend packagé"
+                        ls -la dist/backend/
+                        
+                    else
+                        echo "❌ Dossier backend introuvable"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+        
+        stage('📊 Build Summary') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
+            steps {
+                sh '''
+                    echo "🎯 RÉSUMÉ DU BUILD"
+                    echo "Version: ${BUILD_VERSION}"
+                    echo "Date: $(date)"
+                    
+                    if [ -d "dist" ]; then
+                        echo "📁 Artefacts:"
+                        ls -la dist/
+                        
+                        cat > dist/build-info.json << BEOF
+{
+    "build_version": "${BUILD_VERSION}",
+    "build_number": "${BUILD_NUMBER}",
+    "build_date": "$(date -Iseconds)",
+    "artifacts": [
+        "${ARTIFACT_PREFIX}-frontend.zip",
+        "${ARTIFACT_PREFIX}-backend.zip"
+    ]
+}
+BEOF
+                        
+                        echo "✅ Métadonnées créées"
+                    else
+                        echo "❌ Aucun artefact"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                try {
+                    if (fileExists('dist/')) {
+                        archiveArtifacts artifacts: 'dist/*.zip, dist/*.json', 
+                                       fingerprint: true, 
+                                       allowEmptyArchive: false
+                        echo "✅ Artefacts archivés"
+                    }
+                } catch (Exception e) {
+                    echo "⚠️ Archivage partiel: ${e.getMessage()}"
+                }
+            }
+        }
+        
+        success {
+            echo '🎉 BUILD ET LIVRAISON RÉUSSIS!'
+        }
+        
+        failure {
+            echo '❌ BUILD ÉCHOUÉ!'
+        }
+        
+        unstable {
+            echo '⚠️ BUILD INSTABLE!'
+        }
+    }
+}
